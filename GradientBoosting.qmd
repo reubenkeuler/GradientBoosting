@@ -1,0 +1,277 @@
+---
+title: "Ensemble Methods II - Gradient Boosting"
+format: pdf
+editor: visual
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+
+#### ---------------------------------------------------------------------------
+### Load libraries and dataset
+
+```{r}
+library(tidyverse)
+library(tidymodels)   
+tidymodels_prefer()
+
+library(xgboost)      # gradient boosting engine
+library(vip)          # for variable importance plots
+
+ames <- read_csv("AmesHousing.csv")   # load dataset
+
+# convert all character variables to factor variables
+ames <- ames |>
+  mutate(across(where(is.character), as.factor))
+
+```
+
+
+
+#### ---------------------------------------------------------------------------
+### Data exploration
+
+```{r}
+library(skimr)
+
+skim(ames)
+
+# mix of numerical and categorical (ordinal and nominal) features
+# 113 missing entries in 'Gr_Liv_Area'
+# feature 'Overall_Qual' is ordinal, levels need to be reordered
+# numerical features have different SDs
+
+```
+
+
+```{r}
+# reorder levels of 'Overall_Qual' (default order is alphabetical)
+
+ames <- ames |>
+  mutate(Overall_Qual = factor(Overall_Qual,
+                               levels = c("Very_Poor", "Poor", "Fair", "Below_Average",
+                                          "Average", "Above_Average", "Good", "Very_Good",
+                                          "Excellent", "Very_Excellent")))
+
+```
+
+
+
+#### ---------------------------------------------------------------------------
+### Data splitting
+
+```{r}
+# data splitting
+
+set.seed(208)
+
+ames_split <- initial_split(data = ames, prop = 0.8)
+
+ames_train <- training(ames_split)   # training set
+ames_test <- testing(ames_split)     # test set
+
+```
+
+
+```{r}
+library(caret)
+
+nearZeroVar(ames_train, saveMetrics = TRUE)
+
+# five nzv features - 'Street', 'Utilities', 'Pool_Area', 'Screen_Porch', 'Misc_Val'
+
+```
+
+
+
+#### ---------------------------------------------------------------------------
+### Recipe and blueprint
+
+```{r}
+# create the feature engineering blueprint
+
+ames_blueprint <- recipe(Sale_Price ~ ., data = ames_train) |>
+  step_nzv(Street, Utilities, Pool_Area, Screen_Porch, Misc_Val) |>   # remove nzv features
+  step_impute_mean(Gr_Liv_Area) |>                                    # impute missing entries
+  step_integer(Overall_Qual) |>                                       # label encoding
+  step_normalize(all_numeric_predictors()) |>                         # center and scale
+  step_other(Neighborhood, threshold = 0.01, other = "other") |>      # lump rare neighborhoods
+  step_dummy(all_nominal_predictors(), one_hot = FALSE)               # dummy encode
+
+```
+
+
+
+#### ---------------------------------------------------------------------------
+### Model specification and workflow
+
+```{r}
+# model specification: number of trees, tree depth, and learning rate to be tuned
+# fixing the other hyperparameter min_n = 10 
+
+gbm_spec <- boost_tree(trees = tune(),
+                       learn_rate = tune(),
+                       tree_depth = tune(),
+                       min_n = 10) |>
+  set_engine("xgboost") |>
+  set_mode("regression")
+
+
+# workflow: recipe + model
+gbm_wf <- workflow() |>
+  add_recipe(ames_blueprint) |>
+  add_model(gbm_spec)
+
+```
+
+
+
+#### ---------------------------------------------------------------------------
+### Cross-validation
+
+```{r}
+# CV specifications: 10 folds, 1 repeat
+
+set.seed(208)
+
+ames_folds <- vfold_cv(ames_train, 
+                       v = 10,
+                       repeats = 1)
+
+```
+
+
+```{r}
+# grid of hyperparameter values: 5 x 4 x 3 = 60 combinations
+
+gbm_grid <- expand_grid(trees = c(50, 100, 250, 500, 1000),
+                        learn_rate = c(0.01, 0.1, 1), 
+                        tree_depth = c(1, 2, 4, 6))
+
+gbm_grid
+
+```
+
+
+```{r}
+# implement CV to tune the hyperparameters
+# use appropriate metrics for classification tasks
+
+set.seed(208)
+
+gbm_cv <- tune_grid(gbm_wf,
+                    resamples = ames_folds,
+                    grid = gbm_grid,
+                    metrics = metric_set(rmse, rsq))
+
+```
+
+
+```{r}
+# CV results
+
+collect_metrics(gbm_cv)
+
+```
+
+
+```{r}
+# plotting CV results
+
+autoplot(gbm_cv)
+
+```
+
+
+```{r}
+# top 5 combinations by RMSE
+# use appropriate metrics for classification tasks
+
+show_best(gbm_cv, metric = "rmse")  
+
+```
+
+
+```{r}
+# optimal hyperparameters
+# use appropriate metrics for classification tasks
+
+best_gbm <- select_best(gbm_cv, metric = "rmse")
+
+best_gbm
+
+```
+
+
+
+#### ---------------------------------------------------------------------------
+### Final model and test set evaluation
+
+```{r}
+# build optimal final model
+
+# plug optimal hyperparameters into the workflow
+final_gbm_wf <- finalize_workflow(gbm_wf, best_gbm)  
+
+# fit on the full training set and evaluate once on the test set
+set.seed(208)
+final_gbm_fit <- last_fit(final_gbm_wf,
+                           split = ames_split,
+                           metrics = metric_set(rmse, rsq)) 
+# use appropriate metrics for classification tasks
+
+
+# test set RMSE and R-squared
+collect_metrics(final_gbm_fit)  
+
+```
+
+
+```{r}
+#| eval: false
+
+# for project (since hotel_bookings_test doesn't include response)
+
+final_gbm_wf <- finalize_workflow(gbm_wf, best_gbm)
+
+final_gbm_fit <- fit(final_gbm_wf, data = hotel_bookings_train)
+
+test_preds <- augment(final_gbm_fit, new_data = hotel_bookings_test)
+
+# .pred_Yes = P(response = Yes), use this for Kaggle submission
+test_preds |>
+  select(id, .pred_class, .pred_Yes, .pred_No) |>
+  head()
+
+```
+
+
+
+#### ---------------------------------------------------------------------------
+### Tree summary and variable importance
+
+```{r}
+# pull out the underlying xgboost object
+gbm_engine <- extract_fit_engine(final_gbm_fit)
+
+
+# importance for each column the model saw 
+gbm_vi <- vip::vi(gbm_engine) |> 
+  mutate(Importance_pct = round(100 * Importance / sum(Importance), 1))
+
+
+# variable importance plot
+gbm_vi |>
+  slice_max(Importance_pct, n = 15) |>
+  ggplot(aes(x = Importance_pct, y = fct_reorder(Variable, Importance_pct))) +
+  geom_col() +
+  scale_y_discrete(labels = function(x) str_trunc(x, 30)) +
+  labs(y = NULL)
+
+```
+
+
+
+#### ---------------------------------------------------------------------------
